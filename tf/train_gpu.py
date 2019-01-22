@@ -6,6 +6,8 @@ import os
 import math
 import time
 
+os.environ["CUDA_VISIBLE_DEVICES"] = '1,2'  # temporary env parameter to only use GPU:1 and GPU:2
+
 from absl import flags
 import absl.logging as _logging  # pylint: disable=unused-import
 
@@ -133,6 +135,7 @@ flags.DEFINE_float("init_range", default=0.1,
 
 FLAGS = flags.FLAGS
 
+
 def get_model_fn(n_token, cutoffs):
   def model_fn(inp, tgt, mems, is_training):
     inp = tf.transpose(inp, [1, 0])
@@ -156,34 +159,34 @@ def get_model_fn(n_token, cutoffs):
       for i in range(1, len(tie_projs)):
         tie_projs[i] = True
 
-    loss, new_mems = model.transformer(
-        dec_inp=inp,
-        target=tgt,
-        mems=mems,
-        n_token=n_token,
-        n_layer=FLAGS.n_layer,
-        d_model=FLAGS.d_model,
-        d_embed=FLAGS.d_embed,
-        n_head=FLAGS.n_head,
-        d_head=FLAGS.d_head,
-        d_inner=FLAGS.d_inner,
-        dropout=FLAGS.dropout,
-        dropatt=FLAGS.dropatt,
-        initializer=initializer,
-        proj_initializer=proj_initializer,
-        is_training=is_training,
-        mem_len=FLAGS.mem_len,
-        cutoffs=cutoffs,
-        div_val=FLAGS.div_val,
-        tie_projs=tie_projs,
-        input_perms=None,
-        target_perms=None,
-        head_target=None,
-        same_length=FLAGS.same_length,
-        clamp_len=FLAGS.clamp_len,
-        use_tpu=False,
-        untie_r=FLAGS.untie_r,
-        proj_same_dim=FLAGS.proj_same_dim)
+    loss, acc, new_mems = model.transformer(
+      dec_inp=inp,
+      target=tgt,
+      mems=mems,
+      n_token=n_token,
+      n_layer=FLAGS.n_layer,
+      d_model=FLAGS.d_model,
+      d_embed=FLAGS.d_embed,
+      n_head=FLAGS.n_head,
+      d_head=FLAGS.d_head,
+      d_inner=FLAGS.d_inner,
+      dropout=FLAGS.dropout,
+      dropatt=FLAGS.dropatt,
+      initializer=initializer,
+      proj_initializer=proj_initializer,
+      is_training=is_training,
+      mem_len=FLAGS.mem_len,
+      cutoffs=cutoffs,
+      div_val=FLAGS.div_val,
+      tie_projs=tie_projs,
+      input_perms=None,
+      target_perms=None,
+      head_target=None,
+      same_length=FLAGS.same_length,
+      clamp_len=FLAGS.clamp_len,
+      use_tpu=False,
+      untie_r=FLAGS.untie_r,
+      proj_same_dim=FLAGS.proj_same_dim)
 
     # number of parameters
     num_params = sum([np.prod(v.shape) for v in tf.trainable_variables()])
@@ -199,9 +202,9 @@ def get_model_fn(n_token, cutoffs):
       grads = tf.gradients(loss, all_vars)
       grads_and_vars = list(zip(grads, all_vars))
 
-      return loss, new_mems, grads_and_vars
+      return loss, acc, new_mems, grads_and_vars
     else:
-      return loss, new_mems
+      return loss, acc, new_mems
 
   return model_fn
 
@@ -245,7 +248,7 @@ def train(n_token, cutoffs, ps_device):
 
   per_core_bsz = FLAGS.train_batch_size // FLAGS.num_core_per_host
 
-  tower_mems, tower_losses, tower_new_mems, tower_grads_and_vars = [], [], [], []
+  tower_mems, tower_losses, tower_accs, tower_new_mems, tower_grads_and_vars = [], [], [], [], []
 
   for i in range(FLAGS.num_core_per_host):
     reuse = True if i > 0 else None
@@ -256,25 +259,28 @@ def train(n_token, cutoffs, ps_device):
                                [FLAGS.mem_len, per_core_bsz, FLAGS.d_model])
                 for _ in range(FLAGS.n_layer)]
 
-      loss_i, new_mems_i, grads_and_vars_i = single_core_graph(
-          n_token=n_token,
-          cutoffs=cutoffs,
-          is_training=True,
-          inp=inputs[i],
-          tgt=labels[i],
-          mems=mems_i)
+      loss_i, acc_i, new_mems_i, grads_and_vars_i = single_core_graph(
+        n_token=n_token,
+        cutoffs=cutoffs,
+        is_training=True,
+        inp=inputs[i],
+        tgt=labels[i],
+        mems=mems_i)
 
       tower_mems.append(mems_i)
       tower_losses.append(loss_i)
+      tower_accs.append(acc_i)
       tower_new_mems.append(new_mems_i)
       tower_grads_and_vars.append(grads_and_vars_i)
 
   ## average losses and gradients across towers
   if len(tower_losses) > 1:
     loss = tf.add_n(tower_losses) / len(tower_losses)
+    acc = tf.add_n(tower_accs) / len(tower_accs)
     grads_and_vars = average_grads_and_vars(tower_grads_and_vars)
   else:
     loss = tower_losses[0]
+    acc = tower_accs[0]
     grads_and_vars = tower_grads_and_vars[0]
   grads, all_vars = zip(*grads_and_vars)
 
@@ -323,9 +329,9 @@ def train(n_token, cutoffs, ps_device):
       tf.logging.info("warm start from {}".format(FLAGS.warm_start_path))
       saver.restore(sess, FLAGS.warm_start_path)
 
-    fetches = [loss, tower_new_mems, global_step, gnorm, learning_rate, train_op]
+    fetches = [loss, acc, tower_new_mems, global_step, gnorm, learning_rate, train_op]
 
-    total_loss, prev_step = 0., -1
+    total_loss, total_acc, prev_step = 0., 0., -1
     while True:
       feed_dict = {}
       for i in range(FLAGS.num_core_per_host):
@@ -334,16 +340,18 @@ def train(n_token, cutoffs, ps_device):
 
       fetched = sess.run(fetches, feed_dict=feed_dict)
 
-      loss_np, tower_mems_np, curr_step = fetched[:3]
+      loss_np, acc_np, tower_mems_np, curr_step = fetched[:4]
       total_loss += loss_np
+      total_acc += acc_np
 
       if curr_step > 0 and curr_step % FLAGS.iterations == 0:
         curr_loss = total_loss / (curr_step - prev_step)
+        curr_acc = total_acc / (curr_step - prev_step)
         tf.logging.info("[{}] | gnorm {:.2f} lr {:8.6f} "
-            "| loss {:.2f} | pplx {:>7.2f}, bpc {:>7.4f}".format(
-            curr_step, fetched[-3], fetched[-2],
-            curr_loss, math.exp(curr_loss), curr_loss / math.log(2)))
-        total_loss, prev_step = 0., curr_step
+                        "| loss {:.2f} | acc {:.2f} | pplx {:>7.2f}, bpc {:>7.4f}".format(
+          curr_step, fetched[-3], fetched[-2],
+          curr_loss, curr_acc, math.exp(curr_loss), curr_loss / math.log(2)))
+        total_loss, total_acc, prev_step = 0., 0., curr_step
 
       if curr_step > 0 and curr_step % FLAGS.save_steps == 0:
         save_path = os.path.join(FLAGS.model_dir, "model.ckpt")
@@ -381,7 +389,7 @@ def evaluate(n_token, cutoffs, ps_device):
   labels = tf.split(label_feed, FLAGS.num_core_per_host, 0)
 
   per_core_bsz = FLAGS.eval_batch_size // FLAGS.num_core_per_host
-  tower_mems, tower_losses, tower_new_mems = [], [], []
+  tower_mems, tower_losses, tower_accs, tower_new_mems = [], [], []
 
   for i in range(FLAGS.num_core_per_host):
     with tf.device(assign_to_gpu(i, ps_device)), \
@@ -391,23 +399,26 @@ def evaluate(n_token, cutoffs, ps_device):
                     [FLAGS.mem_len, per_core_bsz, FLAGS.d_model])
                 for _ in range(FLAGS.n_layer)]
 
-      loss_i, new_mems_i = single_core_graph(
-          n_token=n_token,
-          cutoffs=cutoffs,
-          is_training=False,
-          inp=inputs[i],
-          tgt=labels[i],
-          mems=mems_i)
+      loss_i, acc_i, new_mems_i = single_core_graph(
+        n_token=n_token,
+        cutoffs=cutoffs,
+        is_training=False,
+        inp=inputs[i],
+        tgt=labels[i],
+        mems=mems_i)
 
       tower_mems.append(mems_i)
       tower_losses.append(loss_i)
+      tower_accs.append(acc_i)
       tower_new_mems.append(new_mems_i)
 
   ## sum losses across towers
   if len(tower_losses) > 1:
     loss = tf.add_n(tower_losses) / len(tower_losses)
+    acc = tf.add_n(tower_accs) / len(tower_accs)
   else:
     loss = tower_losses[0]
+    acc = tower_accs[0]
 
   ##### Evaluation loop
   tower_mems_np = [
@@ -428,12 +439,12 @@ def evaluate(n_token, cutoffs, ps_device):
     tf.logging.info("Evaluate {}".format(eval_ckpt_path))
     saver.restore(sess, eval_ckpt_path)
 
-    fetches = [loss, tower_new_mems, tf.size(label_feed)]
+    fetches = [loss, acc, tower_new_mems, tf.size(label_feed)]
 
     format_str = "  >> processing batch {{:{0}d}}/{{:{0}d}} ..".format(
         len(str(num_batch)))
 
-    total_loss, total_cnt = 0, 0
+    total_loss, total_acc, total_cnt = 0, 0, 0
     for step in range(num_batch):
       if step % (num_batch // 10) == 0:
         tf.logging.info(format_str.format(step, num_batch))
@@ -445,13 +456,15 @@ def evaluate(n_token, cutoffs, ps_device):
 
       fetched = sess.run(fetches, feed_dict=feed_dict)
 
-      loss_np, tower_mems_np, cnt_np = fetched[:3]
+      loss_np, acc_np, tower_mems_np, cnt_np = fetched[:3]
       total_loss += loss_np * cnt_np
+      total_acc += acc_np * cnt_np
       total_cnt += cnt_np
 
     avg_loss = total_loss / total_cnt
-    tf.logging.info("| loss {:.2f} | pplx {:>7.2f}, bpc {:>7.4f}".format(
-        avg_loss, math.exp(avg_loss), avg_loss / math.log(2)))
+    avg_acc = total_acc / total_cnt
+    tf.logging.info("| loss {:.2f} | acc {:.2f} | pplx {:>7.2f}, bpc {:>7.4f}".format(
+      avg_loss, avg_acc, math.exp(avg_loss), avg_loss / math.log(2)))
 
 
 def main(unused_argv):

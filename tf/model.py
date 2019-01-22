@@ -253,6 +253,7 @@ def mask_adaptive_logsoftmax(hidden, target, n_token, d_embed, d_proj, cutoffs,
       output = _logit(hidden, params_W, softmax_b, params_projs)
       nll = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=target,
                                                            logits=output)
+      acc = tf.cast(tf.equal(target, tf.argmax(output, -1, output_type=tf.int32)), tf.float32)
     else:
       cutoff_ends = [0] + cutoffs + [n_token]
       nll = tf.zeros_like(target, dtype=tf.float32)
@@ -305,7 +306,8 @@ def mask_adaptive_logsoftmax(hidden, target, n_token, d_embed, d_proj, cutoffs,
                                  tf.to_int64(tf.shape(nll)))
   if return_mean:
     nll = tf.reduce_mean(nll)
-  return nll
+    acc = tf.reduce_mean(acc)
+  return nll, acc
 
 
 def mul_adaptive_logsoftmax(hidden, target, n_token, d_embed, d_proj, cutoffs,
@@ -422,6 +424,7 @@ def _create_mask(qlen, mlen, same_length=False):
     ret = tf.concat([ret[:, :qlen] + mask_l - mask_dia, ret[:, qlen:]], 1)
   return ret
 
+
 def _cache_mem(curr_out, prev_mem, mem_len=None):
   if mem_len is None or prev_mem is None:
     new_mem = curr_out
@@ -525,22 +528,19 @@ def transformer(dec_inp, target, mems, n_token, n_layer, d_model, d_embed,
 
     output = tf.layers.dropout(output, dropout, training=is_training)
 
-    logsoftmax_fn = (mul_adaptive_logsoftmax if use_tpu else
-                     mask_adaptive_logsoftmax)
-    loss = logsoftmax_fn(
-        hidden=output,
-        target=target,
-        n_token=n_token,
-        d_embed=d_embed,
-        d_proj=d_model,
-        cutoffs=cutoffs,
-        params=shared_params,
-        tie_projs=tie_projs,
-        initializer=initializer,
-        proj_initializer=proj_initializer,
-        div_val=div_val,
-        perms=target_perms,
-        head_target=head_target,
-        proj_same_dim=proj_same_dim)
-    return loss, new_mems
-
+    loss, acc = mask_adaptive_logsoftmax(
+      hidden=output,
+      target=target,
+      n_token=n_token,
+      d_embed=d_embed,
+      d_proj=d_model,
+      cutoffs=cutoffs,
+      params=shared_params,
+      tie_projs=tie_projs,
+      initializer=initializer,
+      proj_initializer=proj_initializer,
+      div_val=div_val,
+      perms=target_perms,
+      head_target=head_target,
+      proj_same_dim=proj_same_dim)
+    return loss, acc, new_mems
