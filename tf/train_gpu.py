@@ -389,7 +389,7 @@ def evaluate(n_token, cutoffs, ps_device):
   labels = tf.split(label_feed, FLAGS.num_core_per_host, 0)
 
   per_core_bsz = FLAGS.eval_batch_size // FLAGS.num_core_per_host
-  tower_mems, tower_losses, tower_accs, tower_new_mems = [], [], []
+  tower_mems, tower_losses, tower_accs, tower_new_mems = [], [], [], []
 
   for i in range(FLAGS.num_core_per_host):
     with tf.device(assign_to_gpu(i, ps_device)), \
@@ -456,7 +456,7 @@ def evaluate(n_token, cutoffs, ps_device):
 
       fetched = sess.run(fetches, feed_dict=feed_dict)
 
-      loss_np, acc_np, tower_mems_np, cnt_np = fetched[:3]
+      loss_np, acc_np, tower_mems_np, cnt_np = fetched[:4]
       total_loss += loss_np * cnt_np
       total_acc += acc_np * cnt_np
       total_cnt += cnt_np
